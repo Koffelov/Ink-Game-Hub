@@ -1,4 +1,4 @@
--- Ishak Hub: full HSX base with Help Players added to Red Light Green Light.
+-- Ishak Hub: full HSX base with Help Players, Auto Kill Hiders and Lights Out Auto Hover.
 -- Upstream: capitanomoby4-design/hsx-lol @ d39b037a95059d14f36d5f0892ad3a70a8a89957.
 local PlayToggleSound, PlayErrorSound
 -- leak by uwustudios discord.gg/uwustudios
@@ -250,6 +250,14 @@ return function(config)
     return broker
 end
     end)()
+    if MainModule.AutoKillHidersController then
+        pcall(function() MainModule.AutoKillHidersController:Destroy() end)
+        MainModule.AutoKillHidersController = nil
+    end
+    if MainModule.LightsOutHoverController then
+        pcall(function() MainModule.LightsOutHoverController:Destroy() end)
+        MainModule.LightsOutHoverController = nil
+    end
     if MainModule.HelpPlayersController then
         pcall(function() MainModule.HelpPlayersController:Destroy() end)
         MainModule.HelpPlayersController = nil
@@ -7074,6 +7082,12 @@ MainModule.SpikesKillFeature = {
 }
 
 MainModule.toggle_spikes_kill = function(arg)
+	if arg and MainModule.AutoKillHidersController and MainModule.AutoKillHidersController:IsEnabled() then
+		MainModule.notify("Spikes Kill", "Disable Auto Kill Hiders before enabling manual Spikes Kill.", 3)
+		local toggle = MainModule.ToggleRefs and MainModule.ToggleRefs.SpikesKill
+		if toggle and toggle.SetValue then pcall(function() toggle:SetValue(false) end) end
+		return
+	end
 	if arg and not MainModule.is_game_active("HideAndSeek") then
 		MainModule.notify("Spikes Kill", "Wait for HideAndSeek!", 0.9)
 		PlayErrorSound()
@@ -13104,6 +13118,7 @@ MainModule.update_all_toggles_by_game = function()
 	MainModule.update_toggle_availability("AutoDodge", value == "HideAndSeek" and "HideAndSeek" or nil, MainModule.ToggleRefs.AutoDodge)
 	MainModule.update_toggle_availability("InfiniteStamina", value == "HideAndSeek" and "HideAndSeek" or nil, MainModule.ToggleRefs.InfiniteStamina)
 	MainModule.update_toggle_availability("SpikesKill", value == "HideAndSeek" and "HideAndSeek" or nil, MainModule.ToggleRefs.SpikesKill)
+	MainModule.update_toggle_availability("AutoKillHiders", MainModule.is_game_active("HideAndSeek") and "HideAndSeek" or nil, MainModule.ToggleRefs.AutoKillHiders)
 	MainModule.update_toggle_availability("AutoEscape", value == "HideAndSeek" and "HideAndSeek" or nil, MainModule.ToggleRefs.AutoEscape)
 	MainModule.update_toggle_availability("KeyESP", value == "HideAndSeek" and "HideAndSeek" or nil, MainModule.ToggleRefs.KeyESP)
 	MainModule.update_toggle_availability("JumpRopeAntiFall", value == "JumpRope" and "JumpRope" or nil, MainModule.ToggleRefs.JumpRopeAntiFall)
@@ -13157,6 +13172,7 @@ end
 MainModule.GameStateMonitor.DisableGameToggles = function(arg)
 	local v2 = ({
 		HideAndSeek = {
+			"AutoKillHiders",
 			"AutoDodge",
 			"InfiniteStamina",
 			"SpikesKill",
@@ -19286,6 +19302,14 @@ end
 fn9()
 
 MainModule.cleanup_everything = function()
+	if MainModule.AutoKillHidersController then
+		pcall(function() MainModule.AutoKillHidersController:Destroy() end)
+		MainModule.AutoKillHidersController = nil
+	end
+	if MainModule.LightsOutHoverController then
+		pcall(function() MainModule.LightsOutHoverController:Destroy() end)
+		MainModule.LightsOutHoverController = nil
+	end
 	if MainModule.HelpPlayersController then
 		pcall(function() MainModule.HelpPlayersController:Destroy() end)
 		MainModule.HelpPlayersController = nil
@@ -21822,6 +21846,255 @@ end
 
 	local v5 = v3:Section({ Title = "Lights Out", Icon = "moon", Opened = true })
 
+-- Insert inside the existing Lights Out section (v5).
+do
+    local createLightsOutHover = (function()
+-- Optional, round-aware hover. Owns only its attachment/constraint; never changes global gravity.
+return function(config)
+    local player = config.LocalPlayer or (config.Players and config.Players.LocalPlayer)
+    local world, library = config.Workspace, config.Library
+    local clock = config.Clock or os.clock
+    local controller = {}
+    local enabled, destroyed, stepping, syncing = false, false, false, false
+    local generation, retryAt, lastNotice = 0, 0, -math.huge
+    local hover, heartbeat, toggle
+    local connections = {}
+    local requestedHeight = tonumber(config.Height)
+    if not requestedHeight or requestedHeight ~= requestedHeight then requestedHeight = 18 end
+    local height = math.clamp(requestedHeight, 4, 40)
+
+    local function disconnect(connection)
+        if connection then pcall(function() connection:Disconnect() end) end
+    end
+
+    local function stopHover()
+        local previous = hover
+        hover = nil
+        if previous then
+            disconnect(previous.DeathConnection)
+            pcall(previous.Cleanup)
+        end
+    end
+
+    local function notice(message)
+        if clock() - lastNotice < 5 then return end
+        lastNotice = clock()
+        if config.Notify then pcall(config.Notify, message) end
+    end
+
+    local function syncToggle()
+        if syncing or not toggle or not toggle.SetValue then return end
+        syncing = true
+        pcall(function() toggle:SetValue(enabled) end)
+        syncing = false
+    end
+
+    local function gameActive()
+        if config.IsGameActive then
+            local ok, result = pcall(config.IsGameActive)
+            return ok and result == true
+        end
+        local values = world and world:FindFirstChild("Values")
+        local gameValue = values and values:FindFirstChild("CurrentGame")
+        local name = gameValue and gameValue.Value
+        return name == "LightsOut" or name == "LightOut"
+    end
+
+    local function alive()
+        local character = player and player.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if not character or not character.Parent or not root or not root.Parent
+            or not humanoid or humanoid.Health <= 0 or character:FindFirstChild("Dead") then
+            return nil
+        end
+        return character, root, humanoid
+    end
+
+    local function movementBusy()
+        if not config.IsMovementBusy then return false end
+        local ok, result = pcall(config.IsMovementBusy)
+        -- Fail closed if the host cannot establish who owns character movement.
+        return not ok or result == true
+    end
+
+    local function defaultStartHover(_, root, offset)
+        local attachment, alignment
+        local cleaned = false
+        local function cleanup()
+            if cleaned then return end
+            cleaned = true
+            if alignment then pcall(function() alignment:Destroy() end) end
+            if attachment then pcall(function() attachment:Destroy() end) end
+        end
+        local ok, err = pcall(function()
+            attachment = Instance.new("Attachment")
+            attachment.Name = "IshakLightsOutHoverAttachment"
+            attachment.Parent = root
+            alignment = Instance.new("AlignPosition")
+            alignment.Name = "IshakLightsOutHover"
+            alignment.Mode = Enum.PositionAlignmentMode.OneAttachment
+            alignment.Attachment0 = attachment
+            alignment.Position = root.Position + Vector3.new(0, offset, 0)
+            alignment.ApplyAtCenterOfMass = true
+            alignment.RigidityEnabled = false
+            alignment.MaxForce = math.max(root.AssemblyMass * world.Gravity * 8, 50000)
+            alignment.MaxVelocity = 24
+            alignment.Responsiveness = 20
+            alignment.Parent = root
+        end)
+        if not ok then cleanup(); error(err) end
+        return cleanup
+    end
+
+    local function step()
+        if destroyed or not enabled then stopHover(); return false end
+        if library and library.Unloaded then controller:Destroy(); return false end
+        if not gameActive() then stopHover(); return false end
+        local character, root, humanoid = alive()
+        if not character or movementBusy() then stopHover(); return false end
+        if hover then
+            if hover.Character == character and hover.Root == root and hover.Humanoid == humanoid then return true end
+            stopHover()
+        end
+        if clock() < retryAt then return false end
+        local token = generation
+        local ok, cleanup = pcall(config.StartHover or defaultStartHover, character, root, height)
+        if not ok or type(cleanup) ~= "function" then
+            retryAt = clock() + 1
+            notice("Auto Hover could not start; it will retry during Lights Out.")
+            return false
+        end
+        -- An adapter may synchronously cancel, unload, replace the character, or end the round.
+        local currentCharacter, currentRoot, currentHumanoid = alive()
+        if destroyed or not enabled or (library and library.Unloaded) or generation ~= token
+            or currentCharacter ~= character or currentRoot ~= root or currentHumanoid ~= humanoid
+            or not gameActive() or movementBusy() then
+            pcall(cleanup)
+            return false
+        end
+        local current = {Character = character, Root = root, Humanoid = humanoid, Cleanup = cleanup}
+        hover = current
+        if humanoid.Died then
+            current.DeathConnection = humanoid.Died:Connect(function()
+                if hover == current then stopHover() end
+            end)
+        end
+        return true
+    end
+
+    function controller:Step()
+        if stepping then return false end
+        stepping = true
+        local ok, result = pcall(step)
+        stepping = false
+        if not ok then
+            stopHover()
+            retryAt = clock() + 1
+            notice("Auto Hover paused after a character update error.")
+            return false
+        end
+        return result
+    end
+
+    function controller:SetEnabled(value)
+        if not value then
+            enabled = false
+            generation += 1
+            disconnect(heartbeat)
+            heartbeat = nil
+            stopHover()
+            syncToggle()
+            return false
+        end
+        if destroyed or (library and library.Unloaded) then syncToggle(); return false end
+        if enabled then return true end
+        local signal = config.RunService and config.RunService.Heartbeat
+        if not signal then
+            notice("Auto Hover needs the character update service.")
+            syncToggle()
+            return false
+        end
+        enabled = true
+        generation += 1
+        retryAt = 0
+        local ok, connection = pcall(function()
+            return signal:Connect(function() controller:Step() end)
+        end)
+        if not ok or not connection then
+            enabled = false
+            stopHover()
+            syncToggle()
+            notice("Auto Hover could not subscribe to character updates.")
+            return false
+        end
+        heartbeat = connection
+        syncToggle()
+        controller:Step()
+        return true
+    end
+
+    function controller:Stop()
+        self:SetEnabled(false)
+    end
+
+    function controller:Destroy()
+        if destroyed then return end
+        destroyed = true
+        self:SetEnabled(false)
+        for _, connection in ipairs(connections) do disconnect(connection) end
+        connections = {}
+    end
+
+    if player and player.CharacterRemoving then
+        connections[#connections + 1] = player.CharacterRemoving:Connect(function(character)
+            if hover and hover.Character == character then stopHover() end
+        end)
+    end
+    if player and player.CharacterAdded then
+        connections[#connections + 1] = player.CharacterAdded:Connect(function() stopHover() end)
+    end
+    if config.Group then
+        toggle = config.Group:AddToggle("LightsOutAutoHover", {
+            Text = "Auto Hover",
+            Default = false,
+            Tooltip = "Automatically rise and hover during Lights Out. Arm before the round; manual flight takes priority.",
+            Callback = function(value)
+                if not syncing then controller:SetEnabled(value) end
+            end,
+        })
+    end
+    return controller
+end
+    end)()
+    if MainModule.LightsOutHoverController then
+        pcall(function() MainModule.LightsOutHoverController:Destroy() end)
+    end
+    local hoverController = createLightsOutHover({
+        LocalPlayer = localPlayer,
+        Workspace = Workspace,
+        RunService = RunService,
+        Library = lib,
+        Group = v5,
+        Height = 18,
+        IsGameActive = function()
+            return MainModule.is_game_active("LightsOut") or MainModule.is_game_active("LightOut")
+        end,
+        IsMovementBusy = function()
+            return (MainModule.Fly and MainModule.Fly.Enabled == true)
+                or MainModule.BypassedOpFlyEnabled == true
+                or (MainModule.LightsOutSafe and MainModule.LightsOutSafe.Enabled == true)
+                or MainModule.PlayerAttachEnabled == true
+                or MainModule.AutoWinEnabled == true
+        end,
+        Notify = function(message) MainModule.notify("Auto Hover", message, 4) end,
+    })
+    MainModule.LightsOutHoverController = hoverController
+    if type(lib.OnUnload) == "function" then
+        lib:OnUnload(function() hoverController:Destroy() end)
+    end
+end
+
 	MainModule.UIToggle(v5, {
 		Id = "LightsOutSafezone",
 		Title = "Safezone TP",
@@ -21930,6 +22203,525 @@ end
 	})
 
 	local v7 = v3:Section({ Title = "Hide And Seek", Icon = "eye-off", Opened = true })
+
+-- Insert inside the existing Hide And Seek section (v7).
+do
+    local createAutoKillHiders = (function()
+-- HNS controller: observed combo animations trigger the existing spikes route.
+-- The host supplies real tools, movement, animation signals and owned platform resources.
+return function(config)
+    local waitFor = config.Wait or task.wait
+    local spawn = config.Spawn or task.spawn
+    local clock = config.Clock or os.clock
+    local player, workspace = config.LocalPlayer, config.Workspace
+    local controller = {}
+    local enabled, destroyed, busy, workerRunning = false, false, false, false
+    local generation, activeAttempt, enabledCharacter = 0, nil, nil
+    local enabledGameInstance, enabledGameValue, enabledMap
+    local retryAt = setmetatable({}, { __mode = "k" })
+    local attempts, kills, lastResult = 0, 0, nil
+    local nextNotice = 0
+
+    local function child(instance, name)
+        return instance and instance:FindFirstChild(name)
+    end
+
+    local function attribute(instance, name)
+        if not instance or type(instance.GetAttribute) ~= "function" then return nil end
+        local ok, value = pcall(function() return instance:GetAttribute(name) end)
+        return ok and value or nil
+    end
+
+    local function markedDead(subject, character)
+        return character and child(character, "Dead") ~= nil
+            or subject and subject.Character == character
+                and (attribute(subject, "Dead") == true or attribute(subject, "IsDead") == true)
+    end
+
+    local function alive(subject)
+        local character = subject and subject.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local root = child(character, "HumanoidRootPart")
+        if not character or not character.Parent or not humanoid or humanoid.Health <= 0
+            or not root or not root.Parent or markedDead(subject, character) then return nil end
+        return character, humanoid, root
+    end
+
+    local function check(callback, ...)
+        if type(callback) ~= "function" then return false end
+        local ok, value = pcall(callback, ...)
+        return ok and value == true
+    end
+
+    local function gameActive()
+        return check(config.IsGameActive)
+    end
+
+    local function movementAllowed()
+        return not config.CanMove or check(config.CanMove)
+    end
+
+    local function gameStamp()
+        local value = child(child(workspace, "Values"), "CurrentGame")
+        return value, value and value.Value, child(workspace, "HideAndSeekMap")
+    end
+
+    local function sameRound(context)
+        if not gameActive() then return false end
+        local instance, value, map = gameStamp()
+        return instance == context.gameInstance and value == context.gameValue and map == context.map
+    end
+
+    local function notice(message)
+        if clock() < nextNotice then return end
+        nextNotice = clock() + 5
+        pcall(function()
+            if config.Notify then config.Notify(message)
+            elseif config.Library and config.Library.Notify then config.Library:Notify(message, 4) end
+        end)
+    end
+
+    local function knife(character)
+        local ok, tool = pcall(config.FindKnife, character)
+        if not ok or not tool or not tool.Parent then return nil end
+        if tool.Parent ~= character and tool.Parent ~= child(player, "Backpack") then return nil end
+        local valid, result = pcall(function() return tool:IsA("Tool") end)
+        return valid and result and tool or nil
+    end
+
+    local function validLocal(context)
+        local character, humanoid = alive(player)
+        if character ~= context.character then return false end
+        if humanoid.Health < context.lastHealth then context.hurt = true; return false end
+        context.lastHealth = humanoid.Health
+        return not context.cleaned and enabled and not destroyed and generation == context.generation
+            and not (config.Library and config.Library.Unloaded)
+            and sameRound(context) and movementAllowed()
+            and check(config.IsSeeker, player)
+            and knife(context.character) == context.tool
+    end
+
+    local function mayReturn(context)
+        return context.moved and alive(player) == context.character and sameRound(context) and movementAllowed()
+    end
+
+    local function disconnect(connection)
+        if connection then pcall(function() connection:Disconnect() end) end
+    end
+
+    local function finish(context)
+        if context.cleaned then return end
+        context.cleaned = true
+        for _, connection in ipairs(context.connections) do disconnect(connection) end
+        context.connections = {}
+        if mayReturn(context) then
+            local ok, result = pcall(config.Teleport, context.root, context.origin)
+            if not ok or result ~= true then
+                context.returnFailed = true
+                notice("Could not return to the saved position; Auto Kill Hiders stopped.")
+            end
+        end
+        if context.spikes and type(context.spikes.Cleanup) == "function" then
+            pcall(context.spikes.Cleanup)
+        end
+        if activeAttempt == context then activeAttempt = nil end
+    end
+
+    local function stop()
+        local changed = enabled
+        enabled = false
+        enabledCharacter = nil
+        generation += 1
+        if activeAttempt then finish(activeAttempt) end
+        if changed and config.OnEnabledChanged then pcall(config.OnEnabledChanged, false) end
+    end
+
+    local function targetAlive(context)
+        return alive(context.target) == context.targetCharacter and check(config.IsHider, context.target)
+            and not check(config.IsSeeker, context.target)
+    end
+
+    local function targetDied(context)
+        return context.targetHumanoid.Health <= 0 or markedDead(context.target, context.targetCharacter)
+    end
+
+    local function spikesValid(context)
+        local resource = context.spikes
+        return resource and resource.Destination
+            and (not resource.IsValid or check(resource.IsValid))
+    end
+
+    local function move(context, destination)
+        if not validLocal(context) or not destination then return false end
+        -- Mark before the adapter call: an adapter can move and then throw.
+        context.moved = true
+        return config.Teleport(context.root, destination) == true and validLocal(context)
+    end
+
+    local function attempt(context)
+        context.spikes = config.PrepareSpikes()
+        if context.cleaned then
+            if context.spikes and context.spikes.Cleanup then pcall(context.spikes.Cleanup) end
+            return "cancelled"
+        end
+        if not spikesValid(context) or not validLocal(context) then return "unavailable" end
+        local animationConnection = config.ConnectAnimation(context.character, function(track)
+            if not context.attackIssued or context.combo or not validLocal(context)
+                or not check(config.IsCombo, track) then return end
+            context.combo = track
+            if track.Stopped and type(track.Stopped.Connect) == "function" then
+                local connection = track.Stopped:Connect(function()
+                    if not context.cleaned and context.stoppedAt == nil then context.stoppedAt = clock() end
+                end)
+                table.insert(context.connections, connection)
+            end
+            local ok, playing = pcall(function() return track.IsPlaying end)
+            if ok and playing == false then context.stoppedAt = clock() end
+        end)
+        if not animationConnection then return "unavailable" end
+        if context.cleaned then disconnect(animationConnection); return "cancelled" end
+        table.insert(context.connections, animationConnection)
+        local deadline = clock() + (config.ApproachTimeout or 4)
+        local nextAttack = -math.huge
+        while clock() < deadline and not context.combo do
+            if not validLocal(context) or not targetAlive(context) or not spikesValid(context) then return "cancelled" end
+            local _, _, targetRoot = alive(context.target)
+            if not move(context, config.BehindCFrame(targetRoot)) then return "movement failed" end
+            if clock() >= nextAttack then
+                context.attackIssued = true
+                nextAttack = clock() + (config.AttackInterval or 0.5)
+                if config.Attack(context.tool) ~= true then return "attack unavailable" end
+            end
+            if not context.combo then waitFor(0.05) end
+        end
+        if not context.combo then return "no combo" end
+        if not validLocal(context) or not spikesValid(context) then return "cancelled" end
+        if not move(context, context.spikes.Destination) then return "movement failed" end
+        local comboDeadline = clock() + (config.ComboTimeout or 10)
+        while clock() < comboDeadline do
+            if not validLocal(context) or not spikesValid(context) then return "cancelled" end
+            if context.stoppedAt and clock() >= context.stoppedAt + (config.ReturnDelay or 0.6) then break end
+            waitFor(0.05)
+        end
+        return targetDied(context) and "confirmed kill" or "unconfirmed"
+    end
+
+    local function nearest(root)
+        local best, bestCharacter, bestHumanoid, distance = nil, nil, nil, math.huge
+        for _, other in ipairs(config.Players:GetPlayers()) do
+            if other ~= player and (retryAt[other] or 0) <= clock() and check(config.IsHider, other)
+                and not check(config.IsSeeker, other) then
+                local character, humanoid, otherRoot = alive(other)
+                if character then
+                    local candidate = (otherRoot.Position - root.Position).Magnitude
+                    if candidate < distance then
+                        best, bestCharacter, bestHumanoid, distance = other, character, humanoid, candidate
+                    end
+                end
+            end
+        end
+        return best, bestCharacter, bestHumanoid
+    end
+
+    function controller:Step()
+        if busy or not enabled or destroyed then return false end
+        local character, humanoid, root = alive(player)
+        local tool = character and knife(character)
+        local gameInstanceNow, gameValueNow, mapNow = gameStamp()
+        if not character or humanoid.Health <= (config.MinHealth or 20)
+            or character ~= enabledCharacter or not tool or not gameActive()
+            or gameInstanceNow ~= enabledGameInstance or gameValueNow ~= enabledGameValue or mapNow ~= enabledMap
+            or not check(config.IsSeeker, player)
+            or not movementAllowed() or config.Library and config.Library.Unloaded then
+            stop()
+            notice("Auto Kill Hiders needs a seeker with a knife and more than 20 HP in Hide And Seek; turn off conflicting movement features.")
+            return false
+        end
+        local target, targetCharacter, targetHumanoid = nearest(root)
+        if not target then return false end
+        busy = true
+        attempts += 1
+        local gameInstance, gameValue, map = gameStamp()
+        local context = {
+            generation = generation, character = character, root = root, tool = tool,
+            target = target, targetCharacter = targetCharacter, targetHumanoid = targetHumanoid,
+            origin = root.CFrame, gameInstance = gameInstance, gameValue = gameValue, map = map,
+            lastHealth = humanoid.Health,
+            connections = {}, moved = false, cleaned = false, attackIssued = false,
+        }
+        activeAttempt = context
+        local ok, result = pcall(attempt, context)
+        finish(context)
+        busy = false
+        retryAt[target] = clock() + (config.RetryDelay or 3)
+        lastResult = ok and result or "error"
+        if ok and result == "confirmed kill" then kills += 1 end
+        if not ok or context.returnFailed or context.hurt then
+            stop()
+            if not ok then notice("Auto Kill Hiders stopped after an interaction error.") end
+            if context.hurt then notice("Damage detected; returned and stopped Auto Kill Hiders.") end
+        elseif not gameActive() or alive(player) ~= character or not movementAllowed() or not check(config.IsSeeker, player) then
+            stop()
+        end
+        return ok and result == "confirmed kill"
+    end
+
+    function controller:SetEnabled(value)
+        if destroyed then return false end
+        if not value then stop(); return true end
+        if enabled then return true end
+        local character, humanoid = alive(player)
+        if not character or humanoid.Health <= (config.MinHealth or 20)
+            or not knife(character) or not gameActive() or not check(config.IsSeeker, player)
+            or not movementAllowed() or config.Library and config.Library.Unloaded then
+            notice("Auto Kill Hiders needs a seeker with a knife and more than 20 HP in Hide And Seek; turn off conflicting movement features.")
+            return false
+        end
+        enabled = true
+        enabledCharacter = character
+        enabledGameInstance, enabledGameValue, enabledMap = gameStamp()
+        generation += 1
+        if config.OnEnabledChanged then pcall(config.OnEnabledChanged, true) end
+        if not workerRunning then
+            workerRunning = true
+            local ok = pcall(spawn, function()
+                local workerOk = pcall(function()
+                    while enabled and not destroyed do
+                        controller:Step()
+                        if enabled then waitFor(0.1) end
+                    end
+                end)
+                workerRunning = false
+                if not workerOk then stop(); busy = false end
+            end)
+            if not ok then workerRunning = false; stop(); return false end
+        end
+        return true
+    end
+
+    function controller:IsEnabled() return enabled end
+    function controller:GetState()
+        return { Enabled = enabled, Busy = busy, WorkerRunning = workerRunning,
+            Attempts = attempts, Kills = kills, LastResult = lastResult }
+    end
+    function controller:Destroy()
+        if destroyed then return end
+        stop()
+        destroyed = true
+        retryAt = setmetatable({}, { __mode = "k" })
+    end
+    return controller
+end
+    end)()
+
+    if MainModule.AutoKillHidersController then
+        pcall(function() MainModule.AutoKillHidersController:Destroy() end)
+    end
+
+    local function canMove()
+        return not (MainModule.SpikesKillFeature and MainModule.SpikesKillFeature.Enabled)
+            and not (MainModule.Fly and MainModule.Fly.Enabled)
+            and not MainModule.PlayerAttachEnabled
+            and not MainModule.BypassedOpFlyEnabled
+            and not MainModule.AutoWinEnabled
+    end
+
+    local function currentCharacter()
+        local character = localPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if character and character.Parent and humanoid and humanoid.Health > 0
+            and root and root.Parent == character then
+            return character, humanoid, root
+        end
+        return nil
+    end
+
+    local function isActiveSeeker()
+        return MainModule.is_game_active("HideAndSeek")
+            and MainModule.is_seeker(localPlayer) and canMove()
+    end
+
+    local function isKnife(tool)
+        if not tool or not tool.Parent or not tool:IsA("Tool") then return false end
+        local name = tostring(tool.Name):lower():gsub("[^%w]", "")
+        return name:find("knife", 1, true) ~= nil or name:find("dagger", 1, true) ~= nil
+    end
+
+    local function belongsToPlayer(tool, character)
+        local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+        return tool.Parent == character
+            or (backpack and backpack.Parent == localPlayer and tool.Parent == backpack)
+    end
+
+    local function findKnife(character)
+        local current = currentCharacter()
+        if not current or (character and character ~= current) then return nil end
+        for _, tool in ipairs(current:GetChildren()) do
+            if isKnife(tool) then return tool end
+        end
+        local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+        if backpack and backpack.Parent == localPlayer then
+            for _, tool in ipairs(backpack:GetChildren()) do
+                if isKnife(tool) then return tool end
+            end
+        end
+        return nil
+    end
+
+    local function attack(tool)
+        local character, humanoid = currentCharacter()
+        if not character or not isActiveSeeker() or not isKnife(tool)
+            or not belongsToPlayer(tool, character) or tool.Enabled == false then
+            return false
+        end
+        if tool.Parent ~= character then
+            local equipped = pcall(function() humanoid:EquipTool(tool) end)
+            if not equipped then return false end
+        end
+        if localPlayer.Character ~= character or not character.Parent
+            or humanoid.Health <= 0 or tool.Parent ~= character
+            or tool.Enabled == false or not isActiveSeeker() then
+            return false
+        end
+        -- The game-specific knife protocol is not available in the source hub.
+        -- Send a normal Tool request; a combo event, not this return value,
+        -- is the controller's confirmation that the attack animation started.
+        local activated = pcall(function() tool:Activate() end)
+        local released = pcall(function() tool:Deactivate() end)
+        return activated and released
+    end
+
+    local function prepareSpikes()
+        if not currentCharacter() or not isActiveSeeker() then return nil end
+        local map = Workspace:FindFirstChild("HideAndSeekMap")
+        local killingParts = map and map:FindFirstChild("KillingParts")
+        if not map or map.Parent ~= Workspace or not killingParts then return nil end
+        local spike
+        for _, child in ipairs(killingParts:GetChildren()) do
+            if child:IsA("BasePart") then spike = child; break end
+        end
+        if not spike then return nil end
+        local platform
+        local prepared, context = pcall(function()
+            platform = Instance.new("Part")
+            platform.Name = "Ishak_HiderSafetyPlatform"
+            platform.Size = Vector3.new(20, 5, 20)
+            platform.Anchored = true
+            platform.CanCollide = true
+            platform.Transparency = 1
+            platform.Position = spike.Position + Vector3.new(0, 20, 0)
+            platform.Parent = Workspace
+            local cleaned = false
+            return {
+                Destination = CFrame.new(platform.Position + Vector3.new(0, 2.5, 0)),
+                IsValid = function()
+                    return not cleaned and map.Parent == Workspace
+                        and Workspace:FindFirstChild("HideAndSeekMap") == map
+                        and killingParts.Parent == map
+                        and map:FindFirstChild("KillingParts") == killingParts
+                        and spike.Parent == killingParts and platform.Parent == Workspace
+                end,
+                Cleanup = function()
+                    if cleaned then return true end
+                    local removed = pcall(function() platform:Destroy() end)
+                    if removed then cleaned = true end
+                    return removed
+                end,
+            }
+        end)
+        if not prepared then
+            if platform then pcall(function() platform:Destroy() end) end
+            return nil
+        end
+        return context
+    end
+
+    local function connectAnimation(character, callback)
+        if character ~= localPlayer.Character or not character or not character.Parent then return nil end
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if not humanoid or humanoid.Health <= 0 then return nil end
+        local animator = humanoid:FindFirstChildOfClass("Animator")
+        if animator then
+            local connected, connection = pcall(function() return animator.AnimationPlayed:Connect(callback) end)
+            if connected and connection then return connection end
+        end
+        local connected, connection = pcall(function() return humanoid.AnimationPlayed:Connect(callback) end)
+        return connected and connection or nil
+    end
+
+    local function animationId(value)
+        local text = tostring(value or ""):lower()
+        return text:match("^rbxassetid://(%d+)$") or text:match("^(%d+)$")
+    end
+
+    local function isCombo(track)
+        local ok, id = pcall(function()
+            return track and track.Animation and animationId(track.Animation.AnimationId)
+        end)
+        if not ok or not id then return false end
+        local feature = MainModule.SpikesKillFeature
+        for _, known in ipairs(feature and feature.AnimationIds or {}) do
+            if animationId(known) == id then return true end
+        end
+        return false
+    end
+
+    local toggle
+    local syncing = false
+    local function syncEnabled(enabled)
+        if not toggle or syncing or toggle.Value == enabled then return end
+        syncing = true
+        pcall(function() toggle:SetValue(enabled) end)
+        syncing = false
+    end
+
+    local controller = createAutoKillHiders({
+        Players = Players,
+        Workspace = Workspace,
+        LocalPlayer = localPlayer,
+        Library = lib,
+        IsGameActive = function() return MainModule.is_game_active("HideAndSeek") end,
+        IsSeeker = function(player) return MainModule.is_seeker(player) end,
+        IsHider = function(player) return MainModule.is_hider(player) end,
+        CanMove = canMove,
+        FindKnife = findKnife,
+        Attack = attack,
+        BehindCFrame = function(root) return root.CFrame * CFrame.new(0, 0, 2.5) end,
+        PrepareSpikes = prepareSpikes,
+        ConnectAnimation = connectAnimation,
+        IsCombo = isCombo,
+        Teleport = function(root, destination)
+            local character, _, currentRoot = currentCharacter()
+            if not character or root ~= currentRoot or not isActiveSeeker() then return false end
+            local moved, accepted = pcall(MainModule.safe_teleport, destination.Position)
+            if not moved or accepted ~= true then return false end
+            local afterCharacter, _, afterRoot = currentCharacter()
+            if afterCharacter ~= character or afterRoot ~= root or not isActiveSeeker() then return false end
+            -- safe_teleport accepts a position and discards rotation. Retain the
+            -- target's facing for the approach and the saved facing on return.
+            local oriented = pcall(function() root.CFrame = destination end)
+            return oriented
+        end,
+        OnEnabledChanged = syncEnabled,
+        Notify = function(message) MainModule.notify("Auto Kill Hiders", message, 4) end,
+    })
+    MainModule.AutoKillHidersController = controller
+    toggle = v7:AddToggle("AutoKillHiders", {
+        Text = "Auto Kill Hiders",
+        Default = false,
+        Tooltip = "Seeker only: approaches the nearest hider, requests a normal knife attack, then follows the existing Spikes Kill combo timing. Live-game knife behavior is unverified.",
+        Callback = function(enabled)
+            if syncing then return end
+            local accepted = controller:SetEnabled(enabled)
+            if not accepted then syncEnabled(controller:IsEnabled()) end
+        end,
+    })
+    syncEnabled(controller:IsEnabled())
+    if type(lib.OnUnload) == "function" then
+        lib:OnUnload(function() controller:Destroy() end)
+    end
+end
 
 	MainModule.UIToggle(v7, {
 		Id = "FasterSprint",
