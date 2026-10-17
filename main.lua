@@ -121,6 +121,153 @@ do
 	v = fn4()
 	MainModule = MainModule or {}
 	MainModule.Keybinds = MainModule.Keybinds or {}
+-- Coordinate Instant Interact with the normal hold used by Help Players.
+do
+    local createPromptInteraction = (function()
+-- Local prompt-duration broker. A lease keeps one prompt at its recorded native duration.
+-- The host owns the broker lifetime; setting HoldDuration locally does not promise server acceptance.
+return function(config)
+    local workspace = config.Workspace
+    local originals = setmetatable({}, { __mode = "k" })
+    local leases = setmetatable({}, { __mode = "k" })
+    local instant, destroyed = false, false
+    local addedConnection
+    local broker = {}
+
+    local function isPrompt(prompt)
+        if not prompt then return false end
+        local ok, result = pcall(function() return prompt:IsA("ProximityPrompt") end)
+        return ok and result == true
+    end
+
+    local function writeDuration(prompt, duration)
+        return pcall(function() prompt.HoldDuration = duration end)
+    end
+
+    local function remember(prompt)
+        if originals[prompt] ~= nil then return originals[prompt] end
+        local ok, duration = pcall(function() return prompt.HoldDuration end)
+        if not ok or type(duration) ~= "number" or duration ~= duration
+            or duration < 0 or duration == math.huge then
+            return nil
+        end
+        originals[prompt] = duration
+        return duration
+    end
+
+    local function applyInstant(prompt)
+        if leases[prompt] or not isPrompt(prompt) then return end
+        if remember(prompt) ~= nil then writeDuration(prompt, 0) end
+    end
+
+    local function disconnectAdded()
+        local connection = addedConnection
+        addedConnection = nil
+        if connection then pcall(function() connection:Disconnect() end) end
+    end
+
+    local function restoreUnleased()
+        for prompt, duration in pairs(originals) do
+            if not leases[prompt] then
+                writeDuration(prompt, duration)
+                originals[prompt] = nil
+            end
+        end
+    end
+
+    function broker:SetInstant(value)
+        if destroyed then return false end
+        local requested = value and true or false
+        if instant == requested then return true end
+        instant = requested
+        if not instant then
+            disconnectAdded()
+            restoreUnleased()
+            return true
+        end
+
+        -- Subscribe before enumerating so prompts added during discovery are covered.
+        local connected, connection = pcall(function()
+            return workspace.DescendantAdded:Connect(function(prompt)
+                if instant and not destroyed then applyInstant(prompt) end
+            end)
+        end)
+        if not connected or not connection then
+            instant = false
+            return false
+        end
+        addedConnection = connection
+
+        local listed, descendants = pcall(function() return workspace:GetDescendants() end)
+        if not listed or type(descendants) ~= "table" then
+            instant = false
+            disconnectAdded()
+            restoreUnleased()
+            return false
+        end
+        for _, prompt in ipairs(descendants) do applyInstant(prompt) end
+        return true
+    end
+
+    function broker:Acquire(prompt)
+        if destroyed or not isPrompt(prompt) or leases[prompt] then return nil end
+        local duration = remember(prompt)
+        if duration == nil then return nil end
+        if not writeDuration(prompt, duration) then
+            if not instant then originals[prompt] = nil end
+            return nil
+        end
+
+        -- Registry tokens do not retain the prompt; only the caller's live lease does.
+        local token = { Released = false }
+        leases[prompt] = token
+        local lease = { Duration = duration }
+        function lease.Release()
+            if token.Released then return false end
+            token.Released = true
+            if leases[prompt] ~= token then return false end
+            leases[prompt] = nil
+            local nativeDuration = originals[prompt]
+            if nativeDuration == nil then return true end
+            if instant and not destroyed then
+                return writeDuration(prompt, 0)
+            end
+            originals[prompt] = nil
+            return writeDuration(prompt, nativeDuration)
+        end
+        return lease
+    end
+
+    function broker:Destroy()
+        if destroyed then return end
+        destroyed = true
+        instant = false
+        disconnectAdded()
+        -- Active leases remain native until their holders perform release cleanup.
+        restoreUnleased()
+    end
+
+    return broker
+end
+    end)()
+    if MainModule.HelpPlayersController then
+        pcall(function() MainModule.HelpPlayersController:Destroy() end)
+        MainModule.HelpPlayersController = nil
+    end
+    if MainModule.PromptInteraction then
+        pcall(function() MainModule.PromptInteraction:Destroy() end)
+    end
+    if MainModule.ProximityConnection then
+        pcall(function() MainModule.ProximityConnection:Disconnect() end)
+        MainModule.ProximityConnection = nil
+    end
+    local promptInteraction = createPromptInteraction({ Workspace = Workspace })
+    MainModule.PromptInteraction = promptInteraction
+    if type(lib.OnUnload) == "function" then
+        lib:OnUnload(function() promptInteraction:Destroy() end)
+    end
+end
+
 	MainModule._KeybindPress = MainModule._KeybindPress or {}
 
 	fn2 = function(arg, arg2, arg3)
@@ -2479,29 +2626,11 @@ do
 	MainModule.ProximityConnection = nil
 
 	MainModule.toggle_no_cooldown_proximity = function(noCooldownProximityEnabled)
-		MainModule.NoCooldownProximityEnabled = noCooldownProximityEnabled
-
-		local function fn20(arg)
-			if arg:IsA("ProximityPrompt") then
-				arg.HoldDuration = 0
-			end
+		local broker = MainModule.PromptInteraction
+		local enabled = noCooldownProximityEnabled and true or false
+		if broker and broker:SetInstant(enabled) then
+			MainModule.NoCooldownProximityEnabled = enabled
 		end
-
-		if noCooldownProximityEnabled then
-			for _, descendant in pairs(workspace:GetDescendants()) do
-				fn20(descendant)
-			end
-
-			MainModule.ProximityConnection = workspace.DescendantAdded:Connect(function(descendant)
-				if MainModule.NoCooldownProximityEnabled then
-					fn20(descendant)
-				end
-			end)
-		elseif MainModule.ProximityConnection then
-			MainModule.ProximityConnection:Disconnect()
-			MainModule.ProximityConnection = nil
-		end
-
 		PlayToggleSound()
 	end
 
@@ -19161,6 +19290,10 @@ MainModule.cleanup_everything = function()
 		pcall(function() MainModule.HelpPlayersController:Destroy() end)
 		MainModule.HelpPlayersController = nil
 	end
+	if MainModule.PromptInteraction then
+		pcall(function() MainModule.PromptInteraction:Destroy() end)
+		MainModule.PromptInteraction = nil
+	end
 	MainModule.toggle_auto_win(false)
 	MainModule.toggle_fly(false, true)
 	MainModule.ToggleESP(false)
@@ -20910,6 +21043,7 @@ return function(config)
     local generation, enabledCharacter = 0, nil
     local toggle, deathConnection
     local completed, retryAt = {}, {}
+    local nextRescueAt = 0
     local lastNotice = -math.huge
     local startWorker
 
@@ -21069,52 +21203,113 @@ return function(config)
 
     local function attempt(player, character, targetRoot, token, localCharacter, localRoot)
         local origin = localRoot.CFrame
-        local prompt, originalDuration, inputStarted
+        local prompt, releaseHold, releaseLease, dropContext
+        local releaseFailed, promptConsumed = false, false
         local moved, reachedFinish = false, false
+        local function releaseInteraction()
+            -- Clear each callback before invoking it: cancellation/error cleanup is idempotent.
+            local endHold, endLease = releaseHold, releaseLease
+            releaseHold, releaseLease = nil, nil
+            if endHold then
+                local released, result = pcall(endHold)
+                if not released or result == false then releaseFailed = true end
+            end
+            if endLease then
+                local released, result = pcall(endLease)
+                if not released or result == false then releaseFailed = true end
+            end
+            return not releaseFailed
+        end
+        local function pickupState(checkPrompt, checkRange)
+            if not active(token, localCharacter) then return "cancelled" end
+            if alive(player) ~= character then return "target" end
+            -- Pickup can remove the injury marker and disable/remove its prompt.
+            -- Only physical character linkage proves that this client is carrying the target.
+            local owner = carrier(player, targetRoot)
+            if owner == localPlayer then return "confirmed" end
+            if owner then return "taken" end
+            if not prompt.Parent or not prompt.Enabled then
+                promptConsumed = true
+                if checkPrompt then return "prompt" end
+            end
+            -- Injury/prompt removal can replicate before the carry joint. A consumed
+            -- prompt permits only bounded waiting; it never establishes pickup proof.
+            if not injured(player, character) and not promptConsumed then return "recovered" end
+            if checkRange then
+                local _, position = promptLocation(prompt, targetRoot)
+                if distance(localRoot.Position, position) > (tonumber(prompt.MaxActivationDistance) or 10) then
+                    return "range"
+                end
+            end
+            return nil
+        end
         local ok, outcome = pcall(function()
             if not finishCFrame() then return "finish" end
             if not active(token, localCharacter) then return "cancelled" end
             prompt = rescuePrompt(player, character)
             if not prompt then return "prompt" end
             if carrier(player, targetRoot) then return "taken" end
-            local approach, position = promptLocation(prompt, targetRoot)
+            if config.BeforePickup then
+                local captured, context = pcall(config.BeforePickup)
+                if captured then dropContext = context end
+                if not active(token, localCharacter) then return "cancelled" end
+                if alive(player) ~= character then return "target" end
+                if carrier(player, targetRoot) then return "taken" end
+                if not injured(player, character) then return "recovered" end
+                if not prompt.Parent or not prompt.Enabled then return "prompt" end
+            end
+            local approach = promptLocation(prompt, targetRoot)
             moved = true
             if not teleport(localRoot, approach) then return "teleport" end
             waitFor(0.1)
-            if not active(token, localCharacter) then return "cancelled" end
-            if alive(player) ~= character or not injured(player, character) then return "target" end
-            if not prompt.Parent or not prompt.Enabled then return "prompt" end
-            if carrier(player, targetRoot) then return "taken" end
-            local _, currentPosition = promptLocation(prompt, targetRoot)
-            position = currentPosition
-            if distance(localRoot.Position, position) > (tonumber(prompt.MaxActivationDistance) or 10) then
-                return "range"
+            local state = pickupState(true, true)
+            if state and state ~= "confirmed" then return state end
+            local confirmed = state == "confirmed"
+            if not confirmed then
+                local duration = tonumber(prompt.HoldDuration)
+                if config.AcquirePrompt then
+                    local lease = config.AcquirePrompt(prompt)
+                    if type(lease) ~= "table" or type(lease.Release) ~= "function" then
+                        return "interaction"
+                    end
+                    releaseLease = lease.Release
+                    duration = tonumber(lease.Duration)
+                end
+                if not duration or duration ~= duration or duration < 0 then return "holdlength" end
+                if duration == 0 then duration = tonumber(config.FallbackHoldDuration) or 2 end
+                -- Do not silently shorten a real prompt's required hold duration.
+                if duration ~= duration or duration <= 0 or duration > 30 then return "holdlength" end
+                releaseHold = function() prompt:InputHoldEnd() end
+                if config.BeginHold then
+                    local endHold = config.BeginHold(prompt)
+                    if type(endHold) ~= "function" then return "interaction" end
+                    releaseHold = endHold
+                else
+                    prompt:InputHoldBegin()
+                end
+                local holdDeadline = clock() + duration + 0.15
+                while true do
+                    state = pickupState(true, true)
+                    if state == "confirmed" then confirmed = true; break end
+                    -- A consumed prompt can precede replication of the carry joint.
+                    -- Release input now, then use the same bounded confirmation window.
+                    if state == "prompt" then break end
+                    if state then return state end
+                    local remaining = holdDeadline - clock()
+                    if remaining <= 0 then break end
+                    waitFor(math.min(0.05, remaining))
+                end
             end
-            originalDuration = prompt.HoldDuration
-            prompt.HoldDuration = 0
-            if config.FirePrompt then
-                local fired, result = pcall(config.FirePrompt, prompt)
-                if not fired or result == false then return "interaction" end
-            else
-                inputStarted = true
-                prompt:InputHoldBegin()
-                waitFor(0.03)
-                if not active(token, localCharacter) then return "cancelled" end
-                prompt:InputHoldEnd()
-                inputStarted = false
-            end
-
-            local confirmed = false
-            local deadline = clock() + (config.PickupTimeout or 1.5)
-            for _ = 1, 40 do
-                if not active(token, localCharacter) then return "cancelled" end
-                if alive(player) ~= character then return "target" end
-                local owner = carrier(player, targetRoot)
-                if owner == localPlayer then confirmed = true; break end
-                if owner then return "taken" end
-                if not injured(player, character) then return "recovered" end
-                if clock() >= deadline then break end
-                waitFor(0.05)
+            -- Always release the held input and restore the lease before moving to the finish.
+            if not releaseInteraction() then return "interaction" end
+            local deadline = clock() + (tonumber(config.PickupTimeout) or 2.5)
+            while not confirmed do
+                state = pickupState(false, true)
+                if state == "confirmed" then confirmed = true; break end
+                if state then return state end
+                local remaining = deadline - clock()
+                if remaining <= 0 then break end
+                waitFor(math.min(0.05, remaining))
             end
             if not confirmed then return "unconfirmed" end
             if not active(token, localCharacter) then return "cancelled" end
@@ -21130,6 +21325,32 @@ return function(config)
                     and distance(localRoot.Position, destination.Position) <= 12
                     and distance(targetRoot.Position, destination.Position) <= 12
                     and distance(targetRoot.Position, localRoot.Position) <= 12 then
+                    if config.DropPlayer then
+                        local function rescueActive()
+                            return active(token, localCharacter)
+                        end
+                        local function stillCarrying()
+                            return rescueActive() and alive(player) == character
+                                and carrier(player, targetRoot) == localPlayer
+                                and distance(localRoot.Position, destination.Position) <= 12
+                                and distance(targetRoot.Position, destination.Position) <= 12
+                                and distance(targetRoot.Position, localRoot.Position) <= 12
+                        end
+                        if stillCarrying() then
+                            -- The host may activate only a verified game-owned release control.
+                            -- Its errors must not undo an already confirmed rescue.
+                            pcall(config.DropPlayer, dropContext, stillCarrying, rescueActive)
+                            local releaseDeadline = clock() + 1
+                            while rescueActive() and stillCarrying() do
+                                local remaining = releaseDeadline - clock()
+                                if remaining <= 0 then break end
+                                waitFor(math.min(0.05, remaining))
+                            end
+                            if stillCarrying() then
+                                notice("Help Players: release the player using the checkmark at the bottom right; automatic release was not confirmed.")
+                            end
+                        end
+                    end
                     return "success"
                 end
                 waitFor(0.05)
@@ -21138,12 +21359,7 @@ return function(config)
         end)
 
         -- Cooperative cancellation always reaches this cleanup, including a throwing prompt API.
-        if prompt then
-            if inputStarted then pcall(function() prompt:InputHoldEnd() end) end
-            if originalDuration ~= nil then
-                pcall(function() prompt.HoldDuration = originalDuration end)
-            end
-        end
+        releaseInteraction()
         if not ok then outcome = "error" end
         -- A cancelled controller must never move a new character or a new round.
         if moved and not reachedFinish and active(token, localCharacter) then
@@ -21151,10 +21367,11 @@ return function(config)
         end
         if outcome == "success" then
             completed[character] = true
+            nextRescueAt = clock() + (tonumber(config.CycleDelay) or 5)
             return true, outcome
         end
         retryAt[character] = clock() + (config.RetryDelay or 5)
-        if outcome == "finish" then notice("Help Players: set the finish location first.")
+        if outcome == "finish" then notice("Help Players: the automatic Teleport to End destination is unavailable.")
         elseif outcome == "follow" then notice("Help Players: pickup confirmed, but arrival with the player was not confirmed.")
         elseif outcome ~= "cancelled" and outcome ~= "taken" then
             notice("Help Players: rescue was not confirmed; the attempt stopped.")
@@ -21165,6 +21382,7 @@ return function(config)
     function controller:Step(token)
         token = token or generation
         if busy or not active(token, enabledCharacter) then return false, "inactive" end
+        if clock() < nextRescueAt then return false, "cooldown" end
         local localCharacter, _, localRoot = alive(localPlayer)
         local allPlayers = players:GetPlayers()
         for _, player in ipairs(allPlayers) do
@@ -21241,7 +21459,7 @@ return function(config)
         local character, humanoid = alive(localPlayer)
         if not character then syncToggle(); return false end
         if not finishCFrame() then
-            notice("Help Players: set the finish location first.")
+            notice("Help Players: the automatic Teleport to End destination is unavailable.")
             syncToggle()
             return false
         end
@@ -21282,7 +21500,7 @@ return function(config)
     toggle = config.Group:AddToggle("RedLightHelpPlayers", {
         Text = "Help Players",
         Default = false,
-        Tooltip = "Rescue injured players and return to your saved finish location. Pickup must be confirmed.",
+        Tooltip = "Hold the pickup interaction, confirm the carried player, then use Teleport to End automatically. Wait five seconds between rescues.",
         Callback = function(value)
             if not syncingToggle then controller:SetEnabled(value) end
         end,
@@ -21290,6 +21508,232 @@ return function(config)
     return controller
 end
     end)()
+    local createDropInteraction = (function()
+-- Conservative local GUI adapter. The host supplies activation and confirms separation afterward.
+-- Unknown game UI intentionally produces no click rather than guessing an image, key, or remote.
+return function(config)
+    local adapter, owner = {}, {}
+
+    local function read(instance, property)
+        if not instance then return nil end
+        local ok, value = pcall(function() return instance[property] end)
+        if ok then return value end
+        return nil
+    end
+
+    local function isA(instance, className)
+        if not instance then return false end
+        local ok, value = pcall(function() return instance:IsA(className) end)
+        return ok and value == true
+    end
+
+    local function descendants(instance)
+        local ok, values = pcall(function() return instance:GetDescendants() end)
+        if ok and type(values) == "table" then return values end
+        return nil
+    end
+
+    local function playerGui()
+        local gui = read(config.LocalPlayer, "PlayerGui")
+        if gui then return gui end
+        local ok, result = pcall(function()
+            return config.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+                or config.LocalPlayer:FindFirstChild("PlayerGui")
+        end)
+        if ok then return result end
+        return nil
+    end
+
+    local function excluded(instance)
+        if type(config.IsExcluded) ~= "function" then return false end
+        local ok, result = pcall(config.IsExcluded, instance)
+        return not ok or result == true
+    end
+
+    local function visiblePath(instance, boundary)
+        local current, seen = instance, {}
+        while current and not seen[current] do
+            seen[current] = true
+            if excluded(current) or read(current, "Visible") == false
+                or read(current, "Enabled") == false or read(current, "Interactable") == false then
+                return false
+            end
+            if current == boundary then return true end
+            current = read(current, "Parent")
+        end
+        return false
+    end
+
+    local function visible(button, gui)
+        return isA(button, "GuiButton") and visiblePath(button, gui)
+    end
+
+    local function normalize(value)
+        return tostring(value or ""):lower():gsub("[^a-z0-9]", "")
+    end
+
+    local dropNames = {
+        drop = true, dropbutton = true, buttondrop = true,
+        dropplayer = true, dropplayerbutton = true, buttondropplayer = true,
+        dropcarriedplayer = true, dropcarriedplayerbutton = true,
+        putdown = true, putdownbutton = true, buttonputdown = true,
+        putdownplayer = true, putdownplayerbutton = true,
+        release = true, releasebutton = true, buttonrelease = true,
+        releaseplayer = true, releaseplayerbutton = true,
+        carrydrop = true, carrydropbutton = true, dropcarry = true, dropcarrybutton = true,
+    }
+    local carryNames = {
+        carry = true, carrying = true, carryplayer = true, carriedplayer = true,
+        carryingplayer = true, playercarry = true, playercarrying = true,
+        charactercarry = true,
+    }
+    local carrySuffixes = { "gui", "frame", "panel", "container", "controls", "menu", "ui", "hud", "widget", "screen" }
+    for base in pairs(table.clone(carryNames)) do
+        for _, suffix in ipairs(carrySuffixes) do carryNames[base .. suffix] = true end
+    end
+
+    local function checkText(value)
+        if type(value) ~= "string" then return false end
+        local text = value:gsub("<[^>]->", ""):match("^%s*(.-)%s*$")
+        return text == "✓" or text == "✔" or text == "☑"
+    end
+
+    local function hasCheckmark(button)
+        if checkText(read(button, "Text")) then return true end
+        for _, item in ipairs(descendants(button) or {}) do
+            if visiblePath(item, button) and checkText(read(item, "Text")) then return true end
+        end
+        return false
+    end
+
+    local function trustedIdentity(button, context)
+        local current, carryContext = button, false
+        for depth = 0, 3 do
+            if not current then break end
+            local name, text = normalize(read(current, "Name")), normalize(read(current, "Text"))
+            if dropNames[name] or dropNames[text] then return true end
+            if depth > 0 and (carryNames[name] or carryNames[text]) then carryContext = true end
+            current = read(current, "Parent")
+        end
+        return carryContext and not context.VisibleButtons[button] and hasCheckmark(button)
+    end
+
+    local function dimensions(size)
+        local x, y = read(size, "X"), read(size, "Y")
+        if type(x) ~= "number" or type(y) ~= "number" or x ~= x or y ~= y
+            or x <= 0 or y <= 0 or x == math.huge or y == math.huge then
+            return nil
+        end
+        return x, y
+    end
+
+    local function preferredViewport()
+        if type(config.GetViewportSize) ~= "function" then return nil end
+        local ok, size = pcall(config.GetViewportSize)
+        if ok and dimensions(size) then return size end
+        return nil
+    end
+
+    local function bottomRight(button, gui, preferred)
+        local viewport = preferred
+        if not viewport and dimensions(read(gui, "AbsoluteSize")) then viewport = read(gui, "AbsoluteSize") end
+        if not viewport then
+            local current = read(button, "Parent")
+            while current and current ~= gui do
+                if isA(current, "ScreenGui") and dimensions(read(current, "AbsoluteSize")) then
+                    viewport = read(current, "AbsoluteSize")
+                    break
+                end
+                current = read(current, "Parent")
+            end
+        end
+        local width, height = dimensions(viewport)
+        local sizeX, sizeY = dimensions(read(button, "AbsoluteSize"))
+        local position = read(button, "AbsolutePosition")
+        local x, y = read(position, "X"), read(position, "Y")
+        if not width or not sizeX or type(x) ~= "number" or type(y) ~= "number" then return false end
+        local centerX, centerY = x + sizeX / 2, y + sizeY / 2
+        return centerX >= width / 2 and centerX <= width and centerY >= height / 2 and centerY <= height
+    end
+
+    local function guard(callback)
+        if type(callback) ~= "function" then return false end
+        local ok, value = pcall(callback)
+        return ok and value == true
+    end
+
+    function adapter:Capture()
+        local context = { Owner = owner, VisibleButtons = setmetatable({}, { __mode = "k" }), Valid = false }
+        local gui = playerGui()
+        local items = gui and descendants(gui)
+        if not items then return context end
+        context.Gui = gui
+        context.Valid = true
+        for _, item in ipairs(items) do
+            if visible(item, gui) then context.VisibleButtons[item] = true end
+        end
+        return context
+    end
+
+    function adapter:Drop(context, isCarrying, isActive)
+        if not guard(isActive) then return false, "inactive" end
+        if not guard(isCarrying) then return false, "notcarrying" end
+        if type(context) ~= "table" or context.Owner ~= owner or not context.Valid then
+            return false, "snapshot"
+        end
+        if type(config.Activate) ~= "function" then return false, "unsupported" end
+        local gui = playerGui()
+        if not gui or gui ~= context.Gui then return false, "snapshot" end
+        local items = descendants(gui)
+        if not items then return false, "missing" end
+        local viewport, candidate = preferredViewport(), nil
+        for _, item in ipairs(items) do
+            if visible(item, gui) and bottomRight(item, gui, viewport) and trustedIdentity(item, context) then
+                if candidate then return false, "ambiguous" end
+                candidate = item
+            end
+        end
+        if not candidate then return false, "missing" end
+        if not visible(candidate, gui) or not bottomRight(candidate, gui, viewport)
+            or not trustedIdentity(candidate, context) then
+            return false, "missing"
+        end
+        if not guard(isActive) then return false, "inactive" end
+        if not guard(isCarrying) then return false, "notcarrying" end
+        local ok, result = pcall(config.Activate, candidate)
+        if not ok or result == false then return false, "activation" end
+        return true, "activated"
+    end
+
+    return adapter
+end
+    end)()
+    local dropInteraction = createDropInteraction({
+        LocalPlayer = localPlayer,
+        GetViewportSize = function()
+            local camera = Workspace.CurrentCamera
+            return camera and camera.ViewportSize
+        end,
+        IsExcluded = function(instance)
+            return lib.ScreenGui and instance:IsDescendantOf(lib.ScreenGui)
+        end,
+        Activate = function(button)
+            if type(firesignal) ~= "function" then return false end
+            local signal = button.MouseButton1Click
+            if type(getconnections) == "function" then
+                local clickOK, clickListeners = pcall(getconnections, signal)
+                local activatedOK, activatedListeners = pcall(getconnections, button.Activated)
+                if clickOK and activatedOK and type(clickListeners) == "table"
+                    and type(activatedListeners) == "table" and #clickListeners == 0
+                    and #activatedListeners > 0 then
+                    firesignal(button.Activated, nil, 1)
+                    return true
+                end
+            end
+            firesignal(signal)
+            return true
+        end,
+    })
 
     if MainModule.HelpPlayersController then
         pcall(function() MainModule.HelpPlayersController:Destroy() end)
@@ -21317,7 +21761,31 @@ end
             end
             return MainModule.safe_teleport(destination.Position)
         end,
-        FirePrompt = type(fireproximityprompt) == "function" and fireproximityprompt or nil,
+        AcquirePrompt = function(prompt)
+            local broker = MainModule.PromptInteraction
+            local lease = broker and broker:Acquire(prompt)
+            if lease and lease.Duration == 0 then
+                -- A previous script may have lost the native duration by setting it to zero.
+                -- Use an actual two-second local hold; the lease restores the recorded value.
+                local adjusted = pcall(function() prompt.HoldDuration = 2 end)
+                if not adjusted then lease.Release(); return nil end
+                lease.Duration = 2
+            end
+            return lease
+        end,
+        CycleDelay = 5,
+        BeforePickup = function() return dropInteraction:Capture() end,
+        DropPlayer = function(context, isCarrying, isActive)
+            local deadline = os.clock() + 1
+            while isActive() and isCarrying() do
+                local activated, reason = dropInteraction:Drop(context, isCarrying, isActive)
+                if activated or reason ~= "missing" or os.clock() >= deadline then
+                    return activated, reason
+                end
+                task.wait(0.05)
+            end
+            return false
+        end,
         Notify = function(message)
             MainModule.notify("Help Players", message, 4)
         end,
