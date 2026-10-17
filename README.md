@@ -5,8 +5,10 @@
 ## Запуск
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/Koffelov/Ink-Game-Hub/main/main.lua"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Koffelov/Ink-Game-Hub/ca8d2fcc22b97f27766580bb1d09e72bfa1d5fa8/main.lua"))()
 ```
+
+Загрузчик закреплён на проверенном коммите полной версии.
 
 В репозитории находятся main.lua и необходимые библиотеки интерфейса: library.lua, ThemeManager.lua, SaveManager.lua. Основной скрипт загружает эти библиотеки из этого же репозитория. Клавиша **Z** управляет меню.
 
